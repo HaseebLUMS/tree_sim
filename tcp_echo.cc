@@ -8,6 +8,9 @@
 #include <ns3/internet-module.h>
 #include <ns3/network-module.h>
 #include <ns3/point-to-point-module.h>
+#include <ns3/flow-monitor-helper.h>
+#include <ns3/ipv4-flow-classifier.h>
+
 #include <vector>
 #include <fstream>
 
@@ -129,6 +132,9 @@ void PacketReceived(Ptr<const Packet> packet, const Address &from)
     }
 }
 
+uint64_t totalRetransmissions = 0;
+
+
 int
 main(int argc, char* argv[])
 {
@@ -147,7 +153,7 @@ main(int argc, char* argv[])
 
     // Create a point-to-point link
     PointToPointHelper pointToPoint;
-    pointToPoint.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
+    pointToPoint.SetDeviceAttribute("DataRate", StringValue("1Kbps"));
     pointToPoint.SetChannelAttribute("Delay", StringValue("30us"));
 
     NetDeviceContainer devices = pointToPoint.Install(nodes);
@@ -167,7 +173,7 @@ main(int argc, char* argv[])
     PacketSinkHelper tcpServerHelper("ns3::TcpSocketFactory", serverAddress);
     ApplicationContainer serverApps = tcpServerHelper.Install(nodes.Get(1));
     serverApps.Start(Seconds(1));
-    serverApps.Stop(Seconds(12));
+    serverApps.Stop(Seconds(7));
 
     // Attach callback to record packet latencies
     Ptr<PacketSink> sink = DynamicCast<PacketSink>(serverApps.Get(0));
@@ -175,22 +181,58 @@ main(int argc, char* argv[])
 
     // Install custom TCP client on node 0
     Ptr<CustomTcpClient> clientApp = CreateObject<CustomTcpClient>();
-    clientApp->Setup(serverAddress, 100, 10, 10);
-    // clientApp->Setup(serverAddress, 100, 1000000, 10);
+    clientApp->Setup(serverAddress, 1000 /* Packet Size */, 10 /* Rate */, 1 /* Duration */);
     nodes.Get(0)->AddApplication(clientApp);
     clientApp->SetStartTime(Seconds(2));
-    clientApp->SetStopTime(Seconds(20));
+    clientApp->SetStopTime(Seconds(5));
+
+    // // Install Flow Monitor
+    Ptr<FlowMonitor> flowMonitor;
+    FlowMonitorHelper flowHelper;
+    flowMonitor = flowHelper.InstallAll();
 
     // Run simulation
     Simulator::Run();
+    
+    // {
+        // Save latencies to file
+        std::ofstream latencyFile("./scratch/assets/latencies2.txt");
+        for (double latency : latencies)
+        {
+            latencyFile << latency << std::endl;
+        }
+        latencyFile.close();
 
-    // Save latencies to file
-    std::ofstream latencyFile("./scratch/assets/latencies1.txt");
-    for (double latency : latencies)
-    {
-        latencyFile << latency << std::endl;
-    }
-    latencyFile.close();
+        // Analyze the results
+        flowMonitor->CheckForLostPackets();
+        Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowHelper.GetClassifier());
+        FlowMonitor::FlowStatsContainer stats = flowMonitor->GetFlowStats();
+
+        for (const std::pair<FlowId, FlowMonitor::FlowStats> &flow : stats)
+        {
+            // Get the 5-tuple (source/destination info)
+            Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flow.first);
+            std::cout << "Flow " << flow.first << " (" << t.sourceAddress << " -> " << t.destinationAddress << ")\n";
+
+            // Print flow statistics
+            std::cout << "  Tx Packets: " << flow.second.txPackets << "\n";
+            std::cout << "  Tx Bytes: " << flow.second.txBytes << "\n";
+            std::cout << "  Rx Packets: " << flow.second.rxPackets << "\n";
+            std::cout << "  Lost Packets: " << flow.second.lostPackets << "\n";
+
+            // Calculate and print throughput
+            double duration = flow.second.timeLastRxPacket.GetSeconds() - flow.second.timeFirstTxPacket.GetSeconds();
+            if (duration > 0)
+            {
+                double throughput = (flow.second.rxBytes * 8.0) / (duration * 1e6); // Convert to Mbps
+                std::cout << "  Throughput: " << throughput << " Mbps\n";
+            }
+            else
+            {
+                std::cout << "  Throughput: N/A (invalid duration)\n";
+            }
+        }
+    // }
 
     Simulator::Destroy();
 
